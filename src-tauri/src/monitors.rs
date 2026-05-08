@@ -333,3 +333,151 @@ pub fn list_active(registry: &MonitorRegistry) -> Vec<(String, u64)> {
         .map(|(k, v)| (k.clone(), v.interval_secs))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_units() {
+        assert_eq!(parse_duration("30s"), Some(30));
+        assert_eq!(parse_duration("5m"), Some(300));
+        assert_eq!(parse_duration("2h"), Some(7200));
+        assert_eq!(parse_duration("1d"), Some(86400));
+        assert_eq!(parse_duration("90"), Some(90));
+        // bare numbers default to seconds
+        assert_eq!(parse_duration("10mins"), Some(600));
+    }
+
+    #[test]
+    fn parse_duration_floors_to_5_seconds() {
+        assert_eq!(parse_duration("1s"), Some(5));
+        assert_eq!(parse_duration("0s"), Some(5));
+    }
+
+    #[test]
+    fn parse_duration_rejects_garbage() {
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("forever"), None);
+        assert_eq!(parse_duration("5x"), None);
+    }
+
+    #[test]
+    fn parse_schedule_finds_every_directive() {
+        let content = r#"
+GET https://api.example.com/health
+
+### schedule
+every: 60s
+"#;
+        assert_eq!(parse_schedule(content), Some(60));
+    }
+
+    #[test]
+    fn parse_schedule_supports_space_form() {
+        let content = "### schedule\nevery 5m\n";
+        assert_eq!(parse_schedule(content), Some(300));
+    }
+
+    #[test]
+    fn parse_schedule_returns_none_when_block_missing() {
+        let content = "GET https://api.example.com/health\n";
+        assert_eq!(parse_schedule(content), None);
+    }
+
+    #[test]
+    fn parse_schedule_resets_block_on_next_section() {
+        let content = "### schedule\n### other\nevery: 30s\n";
+        assert_eq!(parse_schedule(content), None);
+    }
+
+    #[test]
+    fn parse_http_extracts_method_url_headers_body() {
+        let raw = "POST https://api.example.com/users\nContent-Type: application/json\nAuthorization: Bearer abc\n\n{\"name\":\"alice\"}\n";
+        let (method, url, headers, body) = parse_http(raw).expect("should parse");
+        assert_eq!(method, "POST");
+        assert_eq!(url, "https://api.example.com/users");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0], ("Content-Type".to_string(), "application/json".to_string()));
+        assert_eq!(headers[1], ("Authorization".to_string(), "Bearer abc".to_string()));
+        assert_eq!(body, Some("{\"name\":\"alice\"}".to_string()));
+    }
+
+    #[test]
+    fn parse_http_skips_comments_and_blank_lines() {
+        let raw = "# this is a comment\n\nGET https://api.example.com/x\n";
+        let (method, url, _, body) = parse_http(raw).expect("should parse");
+        assert_eq!(method, "GET");
+        assert_eq!(url, "https://api.example.com/x");
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn parse_http_rejects_invalid_method() {
+        let raw = "FOOBAR https://api.example.com/x\n";
+        assert!(parse_http(raw).is_none());
+    }
+
+    #[test]
+    fn append_monitor_log_writes_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "dante-mon-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let req_path = dir.join("ping.http");
+        fs::write(&req_path, "GET https://example.com/\n").unwrap();
+
+        let event = MonitorEvent {
+            path: req_path.to_string_lossy().to_string(),
+            ts_ms: 1_700_000_000_000,
+            status: Some(200),
+            elapsed_ms: Some(123),
+            ok: true,
+            error: None,
+        };
+        append_monitor_log(&req_path.to_string_lossy(), &event).unwrap();
+        append_monitor_log(&req_path.to_string_lossy(), &event).unwrap();
+
+        let log_path = dir.join("ping.http.monitor.jsonl");
+        assert!(log_path.exists(), "log should exist");
+        let content = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        // Each line should parse as a MonitorEvent shape
+        for line in lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["status"], 200);
+            assert_eq!(v["elapsed_ms"], 123);
+            assert_eq!(v["ok"], true);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_one_against_unreachable_host_returns_error_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "dante-mon-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let req_path = dir.join("bad.http");
+        // 127.0.0.1:1 is reserved/unreachable in practice
+        fs::write(&req_path, "GET http://127.0.0.1:1/\n").unwrap();
+
+        let event = run_one(&req_path).await;
+        assert!(!event.ok, "should not be ok");
+        assert!(event.error.is_some(), "should have error message");
+        // ts_ms should be populated
+        assert!(event.ts_ms > 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

@@ -200,3 +200,156 @@ fn normalize_path(path: &str) -> String {
     }
     p
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn make_temp_dir(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let unique = format!(
+            "dante-mock-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        p.push(unique);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn http_get(port: u16, path: &str) -> (u16, std::collections::HashMap<String, String>, String) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let split = text.find("\r\n\r\n").expect("response has body separator");
+        let head = &text[..split];
+        let body = text[split + 4..].to_string();
+        let mut lines = head.split("\r\n");
+        let status_line = lines.next().unwrap();
+        let status: u16 = status_line.split(' ').nth(1).unwrap().parse().unwrap();
+        let mut headers = std::collections::HashMap::new();
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+            }
+        }
+        (status, headers, body)
+    }
+
+    #[test]
+    fn serves_recorded_response_from_history() {
+        let dir = make_temp_dir("history");
+        std::fs::write(
+            dir.join("get-users.http"),
+            "### List users\nGET https://api.example.com/api/users\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("get-users.http.history.jsonl"),
+            r#"{"response":{"status":201,"headers":[["X-Mocked","yes"],["Content-Type","application/json"]],"body":"[{\"id\":1,\"name\":\"alice\"}]"}}
+"#,
+        )
+        .unwrap();
+
+        let port = free_port();
+        let handle = start(&dir, port).expect("server should start");
+        // Allow server thread to enter recv loop
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (status, headers, body) = http_get(port, "/api/users");
+        assert_eq!(status, 201);
+        assert_eq!(headers.get("x-mocked").map(String::as_str), Some("yes"));
+        assert_eq!(body, r#"[{"id":1,"name":"alice"}]"#);
+
+        handle.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn returns_404_for_unregistered_path() {
+        let dir = make_temp_dir("404");
+        std::fs::write(
+            dir.join("known.http"),
+            "GET https://api.example.com/known\n",
+        )
+        .unwrap();
+
+        let port = free_port();
+        let handle = start(&dir, port).expect("server should start");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (status, _, body) = http_get(port, "/unknown-path");
+        assert_eq!(status, 404);
+        assert!(body.contains("no route for GET"));
+
+        handle.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn placeholder_body_when_no_history() {
+        let dir = make_temp_dir("placeholder");
+        std::fs::write(
+            dir.join("ping.http"),
+            "GET https://api.example.com/ping\n",
+        )
+        .unwrap();
+
+        let port = free_port();
+        let handle = start(&dir, port).expect("server should start");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (status, _, body) = http_get(port, "/ping");
+        assert_eq!(status, 200);
+        assert!(body.contains("no recorded response"));
+
+        handle.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_parse_extracts_method_and_path() {
+        assert_eq!(
+            quick_parse("GET https://api.example.com/users\nAccept: */*\n"),
+            Some(("GET".to_string(), "/users".to_string()))
+        );
+        assert_eq!(
+            quick_parse("# header comment\n\nPOST /local/path\n"),
+            Some(("POST".to_string(), "/local/path".to_string()))
+        );
+        assert_eq!(
+            quick_parse("INVALID-METHOD https://api.example.com/users\n"),
+            None
+        );
+        assert_eq!(quick_parse("# only comments\n# more\n"), None);
+    }
+
+    #[test]
+    fn normalize_path_handles_query_and_trailing_slash() {
+        assert_eq!(normalize_path("/api/users?id=1"), "/api/users");
+        assert_eq!(normalize_path("/api/users/"), "/api/users");
+        assert_eq!(normalize_path("api/users"), "/api/users");
+        assert_eq!(normalize_path("/"), "/");
+    }
+}

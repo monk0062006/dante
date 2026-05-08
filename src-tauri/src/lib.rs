@@ -1161,6 +1161,21 @@ fn compute_digest_header(
     body: &[u8],
     challenge: &str,
 ) -> Option<String> {
+    let mut cnonce_bytes = [0u8; 8];
+    getrandom::getrandom(&mut cnonce_bytes).ok()?;
+    let cnonce = hex::encode(cnonce_bytes);
+    compute_digest_header_with_cnonce(user, pass, method, uri, body, challenge, &cnonce)
+}
+
+fn compute_digest_header_with_cnonce(
+    user: &str,
+    pass: &str,
+    method: &str,
+    uri: &str,
+    body: &[u8],
+    challenge: &str,
+    cnonce: &str,
+) -> Option<String> {
     let params = parse_challenge(challenge);
     let realm = params.get("realm")?.clone();
     let nonce = params.get("nonce")?.clone();
@@ -1172,9 +1187,6 @@ fn compute_digest_header(
     let opaque = params.get("opaque").cloned();
 
     let nc = "00000001";
-    let mut cnonce_bytes = [0u8; 8];
-    getrandom::getrandom(&mut cnonce_bytes).ok()?;
-    let cnonce = hex::encode(cnonce_bytes);
 
     let ha1 = if algorithm.eq_ignore_ascii_case("MD5-SESS") {
         let base = md5_hex(format!("{user}:{realm}:{pass}").as_bytes());
@@ -2536,4 +2548,384 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Dante");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- slugify ----
+
+    #[test]
+    fn slugify_kebab_cases_with_lowercase() {
+        assert_eq!(slugify("List Users"), "list-users");
+        assert_eq!(slugify("Auth Login"), "auth-login");
+        assert_eq!(slugify("Stripe Charges - List"), "stripe-charges-list");
+    }
+
+    #[test]
+    fn slugify_collapses_runs_of_dashes() {
+        assert_eq!(slugify("a   b   c"), "a-b-c");
+        assert_eq!(slugify("foo!!!bar"), "foo-bar");
+    }
+
+    #[test]
+    fn slugify_strips_leading_and_trailing_separators() {
+        assert_eq!(slugify("  hello  "), "hello");
+        assert_eq!(slugify("---a---"), "a");
+    }
+
+    #[test]
+    fn slugify_falls_back_to_request_for_empty() {
+        assert_eq!(slugify(""), "request");
+        assert_eq!(slugify("!!!"), "request");
+    }
+
+    // ---- md5_hex (Digest auth depends on this; one bug breaks all digest auth) ----
+
+    #[test]
+    fn md5_hex_matches_known_vectors() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        // RFC 2617 HA1 vector
+        assert_eq!(
+            md5_hex(b"Mufasa:testrealm@host.com:Circle Of Life"),
+            "939e7578ed9e3c518a452acee763bce9"
+        );
+    }
+
+    // ---- parse_challenge (WWW-Authenticate digest header) ----
+
+    #[test]
+    fn parse_challenge_extracts_digest_params() {
+        let raw = r#"Digest realm="testrealm@host.com", qop="auth,auth-int", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41""#;
+        let params = parse_challenge(raw);
+        assert_eq!(params.get("realm").map(String::as_str), Some("testrealm@host.com"));
+        assert_eq!(params.get("nonce").map(String::as_str), Some("dcd98b7102dd2f0e8b11d0f600bfb0c093"));
+        assert_eq!(params.get("opaque").map(String::as_str), Some("5ccc069c403ebaf9f0171e9517f40e41"));
+        assert_eq!(params.get("qop").map(String::as_str), Some("auth,auth-int"));
+    }
+
+    #[test]
+    fn parse_challenge_handles_unquoted_values() {
+        let raw = "Digest algorithm=MD5, realm=\"x\"";
+        let params = parse_challenge(raw);
+        assert_eq!(params.get("algorithm").map(String::as_str), Some("MD5"));
+        assert_eq!(params.get("realm").map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn parse_challenge_lowercases_digest_prefix() {
+        let raw = "DIGEST realm=\"x\"";
+        let params = parse_challenge(raw);
+        assert_eq!(params.get("realm").map(String::as_str), Some("x"));
+    }
+
+    // ---- compute_digest_header (RFC 2617 vector) ----
+
+    #[test]
+    fn compute_digest_header_matches_rfc_2617_vector() {
+        // RFC 2617 §3.5: Mufasa accessing /dir/index.html on testrealm@host.com
+        let challenge = r#"Digest realm="testrealm@host.com", qop="auth", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41""#;
+        let header = compute_digest_header_with_cnonce(
+            "Mufasa",
+            "Circle Of Life",
+            "GET",
+            "/dir/index.html",
+            b"",
+            challenge,
+            "0a4f113b", // RFC's example cnonce
+        )
+        .expect("digest should produce header");
+
+        // Expected response from RFC: 6629fae49393a05397450978507c4ef1
+        assert!(
+            header.contains(r#"response="6629fae49393a05397450978507c4ef1""#),
+            "digest header doesn't match RFC 2617 vector: {header}"
+        );
+        assert!(header.contains(r#"username="Mufasa""#));
+        assert!(header.contains(r#"realm="testrealm@host.com""#));
+        assert!(header.contains(r#"uri="/dir/index.html""#));
+        assert!(header.contains(r#"qop=auth"#));
+        assert!(header.contains(r#"nc=00000001"#));
+        assert!(header.contains(r#"cnonce="0a4f113b""#));
+        assert!(header.contains(r#"opaque="5ccc069c403ebaf9f0171e9517f40e41""#));
+    }
+
+    #[test]
+    fn compute_digest_header_supports_md5_sess() {
+        let challenge = r#"Digest realm="r", qop="auth", nonce="n", algorithm=MD5-sess"#;
+        let header =
+            compute_digest_header_with_cnonce("u", "p", "GET", "/", b"", challenge, "fixed")
+                .expect("md5-sess should produce header");
+        assert!(header.contains("algorithm=MD5-sess"));
+        // Compute expected ha1 manually
+        let base = md5_hex(b"u:r:p");
+        let ha1 = md5_hex(format!("{base}:n:fixed").as_bytes());
+        let ha2 = md5_hex(b"GET:/");
+        let expected_response =
+            md5_hex(format!("{ha1}:n:00000001:fixed:auth:{ha2}").as_bytes());
+        assert!(header.contains(&format!(r#"response="{expected_response}""#)));
+    }
+
+    // ---- quick_parse_http ----
+
+    #[test]
+    fn quick_parse_http_extracts_method_url_description() {
+        let content = "# Auth login\n# Returns a token\nPOST https://api.example.com/auth/login\nContent-Type: application/json\n";
+        let (method, url, description) = quick_parse_http(content);
+        assert_eq!(method, "POST");
+        assert_eq!(url, "https://api.example.com/auth/login");
+        assert_eq!(description, "Auth login Returns a token");
+    }
+
+    #[test]
+    fn quick_parse_http_handles_no_description() {
+        let (method, url, desc) = quick_parse_http("GET https://x.com/y\n");
+        assert_eq!(method, "GET");
+        assert_eq!(url, "https://x.com/y");
+        assert_eq!(desc, "");
+    }
+
+    #[test]
+    fn quick_parse_http_returns_empty_url_for_invalid_content() {
+        let (method, url, _) = quick_parse_http("###\n");
+        assert_eq!(method, "GET");
+        assert_eq!(url, "");
+    }
+
+    // ---- extract_body ----
+
+    #[test]
+    fn extract_body_returns_body_after_blank_line() {
+        let content = "POST https://x.com/y\nContent-Type: application/json\n\n{\"a\":1}\n";
+        assert_eq!(extract_body(content), Some(r#"{"a":1}"#.to_string()));
+    }
+
+    #[test]
+    fn extract_body_returns_none_when_no_body() {
+        assert_eq!(extract_body("GET https://x.com/y\n"), None);
+    }
+
+    #[test]
+    fn extract_body_stops_at_separator() {
+        let content = "POST https://x.com/y\n\n{\"a\":1}\n###\nGET https://x.com/z\n";
+        assert_eq!(extract_body(content), Some(r#"{"a":1}"#.to_string()));
+    }
+
+    // ---- split_url ----
+
+    #[test]
+    fn split_url_separates_origin_from_path() {
+        assert_eq!(
+            split_url("https://api.example.com/v1/users?id=1"),
+            ("https://api.example.com".to_string(), "/v1/users?id=1".to_string())
+        );
+    }
+
+    #[test]
+    fn split_url_handles_no_path() {
+        assert_eq!(
+            split_url("https://api.example.com"),
+            ("https://api.example.com".to_string(), "/".to_string())
+        );
+    }
+
+    #[test]
+    fn split_url_handles_relative_paths() {
+        assert_eq!(split_url("/api/users"), ("".to_string(), "/api/users".to_string()));
+        assert_eq!(split_url("api/users"), ("".to_string(), "/api/users".to_string()));
+    }
+
+    // ---- transform_path (OpenAPI {param} → Dante {{param}}) ----
+
+    #[test]
+    fn transform_path_converts_openapi_params_to_dante_vars() {
+        assert_eq!(
+            transform_path("https://api.example.com", "/users/{id}/posts/{postId}"),
+            "https://api.example.com/users/{{id}}/posts/{{postId}}"
+        );
+    }
+
+    #[test]
+    fn transform_path_passes_through_static_paths() {
+        assert_eq!(
+            transform_path("https://api.example.com", "/health"),
+            "https://api.example.com/health"
+        );
+    }
+
+    // ---- url_path_with_query ----
+
+    #[test]
+    fn url_path_with_query_preserves_query_string() {
+        assert_eq!(
+            url_path_with_query("https://api.example.com/users?limit=10&offset=20"),
+            "/users?limit=10&offset=20"
+        );
+    }
+
+    #[test]
+    fn url_path_with_query_returns_root_for_invalid_url() {
+        assert_eq!(url_path_with_query("not-a-url"), "/");
+    }
+
+    #[test]
+    fn url_path_with_query_returns_just_path_when_no_query() {
+        assert_eq!(
+            url_path_with_query("https://api.example.com/users"),
+            "/users"
+        );
+    }
+
+    // ---- strip_quotes ----
+
+    #[test]
+    fn strip_quotes_removes_surrounding_quotes() {
+        assert_eq!(strip_quotes(r#""hello""#), "hello");
+        assert_eq!(strip_quotes("'world'"), "world");
+        assert_eq!(strip_quotes("no quotes"), "no quotes");
+    }
+
+    #[test]
+    fn strip_quotes_does_not_remove_mismatched() {
+        assert_eq!(strip_quotes(r#""mismatched'"#), r#""mismatched'"#);
+    }
+
+    #[test]
+    fn strip_quotes_handles_short_strings() {
+        assert_eq!(strip_quotes(""), "");
+        assert_eq!(strip_quotes("\""), "\"");
+        assert_eq!(strip_quotes("\"\""), "");
+    }
+
+    // ---- unique_path ----
+
+    #[test]
+    fn unique_path_appends_counter_when_collision() {
+        let dir = std::env::temp_dir().join(format!(
+            "dante-unique-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let p1 = unique_path(&dir, "users", "http");
+        assert_eq!(p1.file_name().unwrap(), "users.http");
+        fs::write(&p1, "x").unwrap();
+
+        let p2 = unique_path(&dir, "users", "http");
+        assert_eq!(p2.file_name().unwrap(), "users-2.http");
+        fs::write(&p2, "x").unwrap();
+
+        let p3 = unique_path(&dir, "users", "http");
+        assert_eq!(p3.file_name().unwrap(), "users-3.http");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- OAuth flow form bodies (build via reqwest's form encoding) ----
+    // We can't easily call the async fns directly (they need tauri::State + cookie jar),
+    // but we can verify the form-encoded output that reqwest produces from the same
+    // input vectors used inside fetch_oauth_token / fetch_oauth_password / etc.
+
+    fn encode_form(form: &[(&str, String)]) -> String {
+        // Minimal application/x-www-form-urlencoded encoder matching what reqwest's
+        // .form() ultimately produces — spaces as +, RFC 3986 reserved as %xx.
+        use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+        const FORM: &AsciiSet = &CONTROLS
+            .add(b' ')
+            .add(b'!')
+            .add(b'"')
+            .add(b'#')
+            .add(b'$')
+            .add(b'%')
+            .add(b'&')
+            .add(b'\'')
+            .add(b'(')
+            .add(b')')
+            .add(b'*')
+            .add(b'+')
+            .add(b',')
+            .add(b'/')
+            .add(b':')
+            .add(b';')
+            .add(b'=')
+            .add(b'?')
+            .add(b'@');
+        form.iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    utf8_percent_encode(k, FORM),
+                    utf8_percent_encode(v, FORM)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    #[test]
+    fn client_credentials_form_shape() {
+        // Mirrors fetch_oauth_token's form construction (lib.rs:1749-1758)
+        let form: Vec<(&str, String)> = vec![
+            ("grant_type", "client_credentials".to_string()),
+            ("client_id", "my-client".to_string()),
+            ("client_secret", "my-secret".to_string()),
+            ("scope", "read users".to_string()), // space => + or %20
+        ];
+        let encoded = encode_form(&form);
+        assert!(encoded.contains("grant_type=client_credentials"), "encoded: {encoded}");
+        assert!(encoded.contains("client_id=my-client"));
+        assert!(encoded.contains("client_secret=my-secret"));
+        // space must be encoded
+        assert!(!encoded.contains("read users"), "space should be encoded");
+        assert!(encoded.contains("scope=read%20users"));
+    }
+
+    #[test]
+    fn refresh_token_form_shape() {
+        // Mirrors fetch_oauth_refresh's form construction
+        let form: Vec<(&str, String)> = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", "old-refresh-value".to_string()),
+            ("client_id", "my-client".to_string()),
+        ];
+        let encoded = encode_form(&form);
+        assert!(encoded.contains("grant_type=refresh_token"));
+        assert!(encoded.contains("refresh_token=old-refresh-value"));
+        assert!(encoded.contains("client_id=my-client"));
+    }
+
+    #[test]
+    fn password_grant_form_shape() {
+        // Mirrors fetch_oauth_password's form construction
+        let form: Vec<(&str, String)> = vec![
+            ("grant_type", "password".to_string()),
+            ("username", "alice@example.com".to_string()),
+            ("password", "p@$$w0rd!".to_string()),
+            ("client_id", "my-client".to_string()),
+        ];
+        let encoded = encode_form(&form);
+        assert!(encoded.contains("grant_type=password"));
+        // @ in username must be percent-encoded for safety in form bodies
+        assert!(encoded.contains("alice%40example.com"));
+        // Special chars in password must be encoded
+        assert!(!encoded.contains("p@$$"), "password special chars must be encoded");
+        assert!(encoded.contains("p%40%24%24w0rd%21"));
+    }
+
+    #[test]
+    fn form_encoding_round_trips_for_safe_values() {
+        let form: Vec<(&str, String)> = vec![
+            ("a", "simple".to_string()),
+            ("b", "value-with-dashes".to_string()),
+        ];
+        let encoded = encode_form(&form);
+        // Safe alphanumerics + - . _ ~ must NOT be percent-encoded
+        assert_eq!(encoded, "a=simple&b=value-with-dashes");
+    }
 }

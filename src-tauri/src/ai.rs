@@ -440,3 +440,166 @@ fn strip_json_fence(s: &str) -> &str {
     }
     trimmed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_secret_header_catches_common_auth_headers() {
+        assert!(is_secret_header("Authorization"));
+        assert!(is_secret_header("authorization"));
+        assert!(is_secret_header("Cookie"));
+        assert!(is_secret_header("X-API-Key"));
+        assert!(is_secret_header("X-ApiKey"));
+        assert!(is_secret_header("X-Auth-Token"));
+        assert!(is_secret_header("X-Secret-Header"));
+        assert!(!is_secret_header("Content-Type"));
+        assert!(!is_secret_header("Accept"));
+        assert!(!is_secret_header("User-Agent"));
+    }
+
+    #[test]
+    fn redact_preserves_template_vars() {
+        // {{token}}-style references must not be redacted — they're already safe placeholders
+        assert_eq!(redact("{{token}}"), "{{token}}");
+        assert_eq!(redact("{{stripeKey}}"), "{{stripeKey}}");
+    }
+
+    #[test]
+    fn redact_handles_bearer_tokens() {
+        let out = redact("Bearer sk_test_abc123def456ghi789");
+        assert!(out.starts_with("Bearer "));
+        assert!(out.contains("<redacted>"));
+        // Original token should NOT appear verbatim
+        assert!(!out.contains("sk_test_abc123def456ghi789"));
+    }
+
+    #[test]
+    fn redact_handles_basic_auth() {
+        let out = redact("Basic YWxpY2U6aHVudGVyMjAyNg==");
+        assert!(out.starts_with("Basic "));
+        assert!(out.contains("<redacted>"));
+        assert!(!out.contains("YWxpY2U6aHVudGVyMjAyNg"));
+    }
+
+    #[test]
+    fn redact_token_short_values_fully_redacted() {
+        // Short tokens have no head-tail preview — full redaction
+        assert_eq!(redact_token("abc"), "<redacted>");
+        assert_eq!(redact_token("12345678"), "<redacted>");
+    }
+
+    #[test]
+    fn redact_token_long_values_show_head_tail() {
+        // Long tokens show first 4 + last 2 chars, full token must NOT appear
+        let out = redact_token("aaaabbbbccccdddd");
+        assert!(out.contains("aaaa"));
+        assert!(out.contains("dd"));
+        assert!(out.contains("<redacted>"));
+        assert!(!out.contains("aaaabbbbccccdddd"));
+    }
+
+    #[test]
+    fn build_user_prompt_redacts_authorization() {
+        // CRITICAL: this prevents leaking real API keys to the LLM provider
+        let prompt = build_user_prompt(
+            "GET",
+            "https://api.example.com/x",
+            &[
+                ("Authorization".to_string(), "Bearer sk_live_real_secret_key_xyz".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            None,
+        );
+        assert!(!prompt.contains("sk_live_real_secret_key_xyz"), "prompt leaked secret: {prompt}");
+        assert!(prompt.contains("<redacted>"));
+        assert!(prompt.contains("Content-Type: application/json"));
+    }
+
+    #[test]
+    fn build_user_prompt_redacts_api_key_headers() {
+        let prompt = build_user_prompt(
+            "POST",
+            "https://api.openai.com/v1/chat",
+            &[("X-API-Key".to_string(), "raw_secret_value_xxxxxxxxxx".to_string())],
+            Some("{\"hello\":\"world\"}"),
+        );
+        assert!(!prompt.contains("raw_secret_value_xxxxxxxxxx"), "prompt leaked api key");
+        assert!(prompt.contains("{\"hello\":\"world\"}"));
+    }
+
+    #[test]
+    fn build_user_prompt_includes_method_and_url() {
+        let prompt = build_user_prompt("PATCH", "https://api.example.com/users/42", &[], None);
+        assert!(prompt.starts_with("PATCH https://api.example.com/users/42\n"));
+    }
+
+    #[test]
+    fn strip_json_fence_handles_json_label() {
+        let raw = "```json\n{\"a\":1}\n```";
+        assert_eq!(strip_json_fence(raw), "{\"a\":1}");
+    }
+
+    #[test]
+    fn strip_json_fence_handles_unlabeled_fence() {
+        let raw = "```\n{\"a\":1}\n```";
+        assert_eq!(strip_json_fence(raw), "{\"a\":1}");
+    }
+
+    #[test]
+    fn strip_json_fence_passes_through_when_no_fence() {
+        assert_eq!(strip_json_fence("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(strip_json_fence("  {\"a\":1}  "), "{\"a\":1}");
+    }
+
+    #[test]
+    fn truncate_caps_long_strings() {
+        let long = "a".repeat(500);
+        let out = truncate(&long, 100);
+        // 100 chars from input + 1 ellipsis char = 101 chars; ellipsis is 3 bytes in UTF-8
+        assert_eq!(out.chars().count(), 101);
+        assert!(out.ends_with("…"));
+    }
+
+    #[test]
+    fn truncate_passes_short_strings_through() {
+        assert_eq!(truncate("hi", 100), "hi");
+    }
+
+    #[test]
+    fn review_raw_parses_full_response_shape() {
+        // The model MUST return this exact shape; verify our deserializer accepts it
+        let json = r#"{
+            "suggested_name": "users-list",
+            "summary": "Lists users",
+            "tests": ["status == 200", "body.data exists"],
+            "extracts": [{"var_name": "firstId", "source": "body.data[0].id"}],
+            "security_observations": ["Bearer token hardcoded"]
+        }"#;
+        let parsed: ReviewRaw = serde_json::from_str(json).expect("should parse");
+        assert_eq!(parsed.suggested_name, "users-list");
+        assert_eq!(parsed.tests.len(), 2);
+        assert_eq!(parsed.extracts.len(), 1);
+        assert_eq!(parsed.extracts[0].var_name, "firstId");
+        assert_eq!(parsed.security_observations.len(), 1);
+    }
+
+    #[test]
+    fn anthropic_response_picks_text_block_skipping_others() {
+        // Anthropic responses can have multiple content blocks of varying types — verify
+        // we extract the text block and ignore unknown types.
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "..."},
+                {"type": "text", "text": "actual response"}
+            ]
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(json).expect("should parse");
+        let text = parsed.content.into_iter().find_map(|b| match b {
+            AnthropicContentBlock::Text { text } => Some(text),
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some("actual response"));
+    }
+}

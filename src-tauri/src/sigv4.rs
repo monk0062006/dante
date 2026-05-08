@@ -80,13 +80,23 @@ pub fn sign_request(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<SignedHeaders, String> {
+    sign_request_at(params, method, url, headers, body, OffsetDateTime::now_utc())
+}
+
+pub fn sign_request_at(
+    params: &AwsParams,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    now: OffsetDateTime,
+) -> Result<SignedHeaders, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("url: {e}"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| "url missing host".to_string())?
         .to_string();
 
-    let now = OffsetDateTime::now_utc();
     let amz_date = now.format(AMZ_DATE_FMT).map_err(|e| e.to_string())?;
     let date = now.format(DATE_FMT).map_err(|e| e.to_string())?;
 
@@ -191,4 +201,143 @@ fn canonical_query_string(query: &str) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    // Reference signatures generated from a direct spec implementation in Python
+    // (independent reference: hashlib + hmac following AWS SigV4 spec exactly).
+    // Any divergence from these = bug in our Rust signer.
+
+    #[test]
+    fn signs_get_with_query_matches_reference() {
+        let params = AwsParams {
+            access_key: "AKIDEXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            region: "us-east-1".to_string(),
+            service: "service".to_string(),
+            session_token: None,
+        };
+        let when = datetime!(2015-08-30 12:36:00 UTC);
+
+        let signed = sign_request_at(
+            &params,
+            "GET",
+            "https://example.amazonaws.com/?Param2=value2&Param1=value1",
+            &[],
+            b"",
+            when,
+        )
+        .expect("sign should succeed");
+
+        assert_eq!(signed.amz_date, "20150830T123600Z");
+        assert_eq!(
+            signed.content_sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert!(
+            signed.authorization.contains(
+                "Signature=311c7f58b10b06de8540bb5a27f441ee0609f1d5ad7b191e68d7ea87d90e3d6b"
+            ),
+            "authorization mismatch: {}",
+            signed.authorization
+        );
+        assert!(signed
+            .authorization
+            .contains("Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request"));
+        assert!(signed
+            .authorization
+            .contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
+    }
+
+    #[test]
+    fn signs_post_with_body_matches_reference() {
+        let params = AwsParams {
+            access_key: "AKIDEXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            region: "us-west-2".to_string(),
+            service: "s3".to_string(),
+            session_token: None,
+        };
+        let when = datetime!(2015-08-30 12:36:00 UTC);
+
+        let signed = sign_request_at(
+            &params,
+            "POST",
+            "https://s3.us-west-2.amazonaws.com/mybucket/key.txt",
+            &[("Content-Type".to_string(), "text/plain".to_string())],
+            b"hello world",
+            when,
+        )
+        .expect("sign should succeed");
+
+        assert_eq!(
+            signed.content_sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert!(
+            signed.authorization.contains(
+                "Signature=cdc6c910d7cb8378b312c31999e047a6e0e1e349223b581d210eeb43b1a8343d"
+            ),
+            "authorization mismatch: {}",
+            signed.authorization
+        );
+        // content-type should be in the signed headers since it's in the spec list
+        assert!(signed
+            .authorization
+            .contains("SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date"));
+    }
+
+    #[test]
+    fn changing_body_changes_signature() {
+        let params = AwsParams {
+            access_key: "AKIDEXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            region: "us-east-1".to_string(),
+            service: "service".to_string(),
+            session_token: None,
+        };
+        let when = datetime!(2015-08-30 12:36:00 UTC);
+        let a = sign_request_at(&params, "POST", "https://x.amazonaws.com/", &[], b"a", when)
+            .unwrap();
+        let b = sign_request_at(&params, "POST", "https://x.amazonaws.com/", &[], b"b", when)
+            .unwrap();
+        assert_ne!(a.authorization, b.authorization);
+        assert_ne!(a.content_sha256, b.content_sha256);
+    }
+
+    #[test]
+    fn session_token_is_passed_through() {
+        let params = AwsParams {
+            access_key: "AKIDEXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            region: "us-east-1".to_string(),
+            service: "service".to_string(),
+            session_token: Some("FAKE-SESSION-TOKEN".to_string()),
+        };
+        let when = datetime!(2015-08-30 12:36:00 UTC);
+        let signed = sign_request_at(&params, "GET", "https://x.amazonaws.com/", &[], b"", when)
+            .unwrap();
+        assert_eq!(signed.session_token.as_deref(), Some("FAKE-SESSION-TOKEN"));
+        // session token must be part of signed headers (so server validates it wasn't tampered)
+        assert!(signed.authorization.contains("x-amz-security-token"));
+    }
+
+    #[test]
+    fn determinism_at_fixed_time() {
+        let params = AwsParams {
+            access_key: "AKIDEXAMPLE".to_string(),
+            secret_key: "secret123".to_string(),
+            region: "eu-west-1".to_string(),
+            service: "lambda".to_string(),
+            session_token: None,
+        };
+        let when = datetime!(2025-01-15 09:00:00 UTC);
+        let a = sign_request_at(&params, "GET", "https://lambda.eu-west-1.amazonaws.com/2015-03-31/functions", &[], b"", when).unwrap();
+        let b = sign_request_at(&params, "GET", "https://lambda.eu-west-1.amazonaws.com/2015-03-31/functions", &[], b"", when).unwrap();
+        assert_eq!(a.authorization, b.authorization);
+    }
 }
