@@ -5,6 +5,7 @@ description = "Paste a curl. Get a runnable, named, versioned request."
 authors = ["Dante contributors"]
 edition = "2021"
 license = "MIT"
+default-run = "dante"
 
 [lib]
 name = "dante_lib"
