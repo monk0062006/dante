@@ -1,6 +1,6 @@
 [package]
 name = "dante"
-version = "0.1.0"
+version = "0.1.1"
 description = "Paste a curl. Get a runnable, named, versioned request."
 authors = ["Dante contributors"]
 edition = "2021"
