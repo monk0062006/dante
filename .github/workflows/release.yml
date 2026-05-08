@@ -6,7 +6,41 @@ on:
       - 'v*'
 
 jobs:
+  create-release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: create
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: context.ref.replace('refs/tags/', ''),
+              name: `Dante ${context.ref.replace('refs/tags/', '')}`,
+              draft: true,
+              prerelease: false,
+              body: [
+                'See [CHANGELOG.md](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/blob/main/CHANGELOG.md) for what changed.',
+                '',
+                '## Downloads',
+                '',
+                '- **Windows**: `Dante_*_x64-setup.exe` (NSIS) or `Dante_*_x64_en-US.msi`',
+                '- **macOS Apple Silicon**: `Dante_*_aarch64.dmg`',
+                '- **macOS Intel**: `Dante_*_x64.dmg`',
+                '- **Linux**: `Dante_*_amd64.AppImage`, `*.deb`, or `*.rpm`',
+                '- **CLI** (`dante-run`): standalone binary attached separately',
+              ].join('\n'),
+            });
+            return data.id;
+
   build:
+    needs: create-release
     permissions:
       contents: write
 
@@ -65,19 +99,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Dante ${{ github.ref_name }}'
-          releaseBody: |
-            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for what changed.
-
-            ## Downloads
-
-            - **Windows**: `.msi` or `.exe` (NSIS) installer below
-            - **macOS**: `.dmg` for arm64 (Apple Silicon) or x64 (Intel)
-            - **Linux**: `.AppImage`, `.deb`, or `.rpm`
-            - **CLI** (`dante-run`): standalone binary attached separately
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           args: --target ${{ matrix.target }}
 
       - name: Build dante-run CLI

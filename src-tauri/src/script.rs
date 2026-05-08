@@ -338,3 +338,97 @@ pub fn run_script(input: ScriptInput) -> ScriptOutcome {
         error: user_error,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> ScriptInput {
+        ScriptInput {
+            script: String::new(),
+            env: vec![],
+            method: "GET".to_string(),
+            url: "https://api.example.com/x".to_string(),
+            headers: vec![],
+            body: None,
+            response: None,
+            timeout_ms: 5000,
+        }
+    }
+
+    #[test]
+    fn pre_script_can_set_header_and_env() {
+        let mut input = base();
+        input.script = r#"
+            dante.headers.set("X-Custom", "abc");
+            dante.env.set("token", "tk_123");
+            console.log("ok", dante.method);
+        "#.to_string();
+        let out = run_script(input);
+        assert!(out.error.is_none(), "script error: {:?}", out.error);
+        assert!(out.headers.iter().any(|(k, v)| k == "X-Custom" && v == "abc"));
+        assert!(out.env.iter().any(|(k, v)| k == "token" && v == "tk_123"));
+        assert!(out.logs.iter().any(|l| l.contains("ok GET")));
+    }
+
+    #[test]
+    fn post_script_reads_response_and_extracts() {
+        let mut input = base();
+        input.response = Some(ResponseDataForScript {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: r#"{"access_token":"jwt-xyz","id":42}"#.to_string(),
+            elapsed_ms: 145,
+        });
+        input.script = r#"
+            const data = JSON.parse(dante.response.body);
+            dante.env.set("token", data.access_token);
+            dante.env.set("id", String(data.id));
+        "#.to_string();
+        let out = run_script(input);
+        assert!(out.error.is_none(), "script error: {:?}", out.error);
+        assert!(out.env.iter().any(|(k, v)| k == "token" && v == "jwt-xyz"));
+        assert!(out.env.iter().any(|(k, v)| k == "id" && v == "42"));
+    }
+
+    #[test]
+    fn pm_shim_supports_postman_style_tests() {
+        let mut input = base();
+        input.response = Some(ResponseDataForScript {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: r#"{"users":[{"id":1}]}"#.to_string(),
+            elapsed_ms: 50,
+        });
+        input.script = r#"
+            pm.test("status is 200", () => {
+                pm.expect(pm.response.code).to.equal(200);
+            });
+            pm.test("body has users", () => {
+                const j = pm.response.json();
+                pm.expect(j).to.have.property("users");
+            });
+            pm.test("this fails on purpose", () => {
+                pm.expect(1).to.equal(2);
+            });
+            pm.environment.set("firstUserId", String(pm.response.json().users[0].id));
+        "#.to_string();
+        let out = run_script(input);
+        assert!(out.error.is_none(), "script error: {:?}", out.error);
+        assert_eq!(out.tests.len(), 3);
+        assert!(out.tests[0].pass);
+        assert!(out.tests[1].pass);
+        assert!(!out.tests[2].pass);
+        assert!(out.env.iter().any(|(k, v)| k == "firstUserId" && v == "1"));
+    }
+
+    #[test]
+    fn syntax_error_is_reported() {
+        let mut input = base();
+        input.script = "this is not { valid javascript".to_string();
+        let out = run_script(input);
+        assert!(out.error.is_some(), "expected error for syntax error");
+    }
+}
