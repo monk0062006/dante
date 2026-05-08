@@ -110,7 +110,7 @@ fn load_cookies(folder: String, state: tauri::State<'_, AppState>) -> Result<usi
     Ok(count)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ImportResult {
     pub created: Vec<String>,
     pub skipped: Vec<String>,
@@ -1657,6 +1657,26 @@ async fn oauth_device_poll(
     Err("device flow timed out".to_string())
 }
 
+async fn post_token_form(
+    client: &reqwest::Client,
+    token_url: &str,
+    form: &[(&str, String)],
+    error_label: &str,
+) -> Result<serde_json::Value, String> {
+    let resp = client
+        .post(token_url)
+        .form(form)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("{error_label} {status}: {body}"));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))
+}
+
 #[tauri::command]
 async fn fetch_oauth_refresh(
     token_url: String,
@@ -1686,18 +1706,7 @@ async fn fetch_oauth_refresh(
             form.push(("scope", s));
         }
     }
-    let resp = client
-        .post(&token_url)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!("refresh {status}: {body}"));
-    }
-    serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))
+    post_token_form(&client, &token_url, &form, "refresh").await
 }
 
 #[tauri::command]
@@ -2927,5 +2936,533 @@ mod tests {
         let encoded = encode_form(&form);
         // Safe alphanumerics + - . _ ~ must NOT be percent-encoded
         assert_eq!(encoded, "a=simple&b=value-with-dashes");
+    }
+
+    // ---- Importer integration tests ----
+
+    fn temp_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dante-import-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn import_har_creates_http_files_with_headers_and_body() {
+        let dir = temp_test_dir("har");
+        let har_path = dir.join("session.har");
+        fs::write(
+            &har_path,
+            r#"{
+                "log": {
+                    "entries": [
+                        {
+                            "request": {
+                                "method": "GET",
+                                "url": "https://api.example.com/users",
+                                "headers": [
+                                    {"name": "Accept", "value": "application/json"},
+                                    {"name": ":authority", "value": "should-be-skipped"}
+                                ]
+                            }
+                        },
+                        {
+                            "request": {
+                                "method": "POST",
+                                "url": "https://api.example.com/users",
+                                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                                "postData": {"text": "{\"name\":\"alice\"}"}
+                            }
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = import_har(
+            dir.to_string_lossy().to_string(),
+            har_path.to_string_lossy().to_string(),
+        )
+        .expect("import should succeed");
+
+        assert_eq!(result.created.len(), 2, "expected 2 files");
+        let import_dir = dir.join("har-import");
+        let entries: Vec<_> = fs::read_dir(&import_dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 2);
+
+        // Verify content of one of the files
+        let mut found_post = false;
+        for entry in entries {
+            let content = fs::read_to_string(entry.path()).unwrap();
+            if content.starts_with("POST") {
+                found_post = true;
+                assert!(content.contains("https://api.example.com/users"));
+                assert!(content.contains("Content-Type: application/json"));
+                assert!(content.contains(r#"{"name":"alice"}"#));
+                // The pseudo-header `:authority` must be skipped (HTTP/2 internal)
+                assert!(!content.contains(":authority"));
+            }
+        }
+        assert!(found_post, "POST file should exist");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_har_returns_error_on_missing_log_entries() {
+        let dir = temp_test_dir("har-bad");
+        let har_path = dir.join("bad.har");
+        fs::write(&har_path, r#"{"not_har": true}"#).unwrap();
+        let err = import_har(
+            dir.to_string_lossy().to_string(),
+            har_path.to_string_lossy().to_string(),
+        )
+        .expect_err("should fail on missing /log/entries");
+        assert!(err.contains("entries"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_insomnia_groups_requests_into_subfolders() {
+        let dir = temp_test_dir("insomnia");
+        let spec_path = dir.join("insomnia.json");
+        fs::write(
+            &spec_path,
+            r#"{
+                "resources": [
+                    {"_type": "request_group", "_id": "g1", "name": "Authentication"},
+                    {
+                        "_type": "request",
+                        "_id": "r1",
+                        "name": "Login",
+                        "method": "POST",
+                        "url": "https://api.example.com/login",
+                        "parentId": "g1",
+                        "body": {"text": "{\"username\":\"alice\"}"}
+                    },
+                    {
+                        "_type": "request",
+                        "_id": "r2",
+                        "name": "Health Check",
+                        "method": "GET",
+                        "url": "https://api.example.com/health",
+                        "parentId": ""
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let result = import_insomnia(
+            dir.to_string_lossy().to_string(),
+            spec_path.to_string_lossy().to_string(),
+        )
+        .expect("import should succeed");
+        assert_eq!(result.created.len(), 2);
+
+        let import_dir = dir.join("insomnia-import");
+        let auth_dir = import_dir.join("authentication");
+        assert!(auth_dir.exists(), "auth subfolder should exist");
+        let login_file = auth_dir.join("login.http");
+        assert!(login_file.exists(), "login.http should exist in auth/");
+        let login_content = fs::read_to_string(&login_file).unwrap();
+        assert!(login_content.contains("# Login"));
+        assert!(login_content.contains("POST https://api.example.com/login"));
+        assert!(login_content.contains(r#"{"username":"alice"}"#));
+
+        let health_file = import_dir.join("health-check.http");
+        assert!(health_file.exists(), "ungrouped request goes to root");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_postman_creates_collection_folder() {
+        let dir = temp_test_dir("postman");
+        let spec_path = dir.join("collection.json");
+        fs::write(
+            &spec_path,
+            r#"{
+                "info": {"name": "My API"},
+                "item": [
+                    {
+                        "name": "List Users",
+                        "request": {
+                            "method": "GET",
+                            "url": {"raw": "https://api.example.com/users?limit=10"},
+                            "header": [{"key": "Accept", "value": "application/json"}]
+                        }
+                    },
+                    {
+                        "name": "Auth",
+                        "item": [
+                            {
+                                "name": "Login",
+                                "request": {
+                                    "method": "POST",
+                                    "url": {"raw": "https://api.example.com/login"},
+                                    "body": {"raw": "{\"u\":\"a\"}"}
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let result = import_postman(
+            dir.to_string_lossy().to_string(),
+            spec_path.to_string_lossy().to_string(),
+        )
+        .expect("import should succeed");
+        assert!(result.created.len() >= 2);
+
+        let collection_dir = dir.join("my-api");
+        assert!(collection_dir.exists());
+        // List Users at top level
+        let mut found_list = false;
+        let mut found_login = false;
+        for created in &result.created {
+            let content = fs::read_to_string(created).unwrap();
+            if content.contains("https://api.example.com/users") {
+                found_list = true;
+            }
+            if content.contains("https://api.example.com/login") {
+                found_login = true;
+                assert!(content.contains(r#"{"u":"a"}"#));
+            }
+        }
+        assert!(found_list && found_login);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_openapi_generates_request_per_operation() {
+        let dir = temp_test_dir("openapi");
+        let spec_path = dir.join("openapi.json");
+        fs::write(
+            &spec_path,
+            r#"{
+                "openapi": "3.0.0",
+                "info": {"title": "Test API", "version": "1.0"},
+                "servers": [{"url": "https://api.example.com/v1"}],
+                "paths": {
+                    "/users": {
+                        "get": {
+                            "summary": "List users",
+                            "operationId": "listUsers"
+                        },
+                        "post": {
+                            "summary": "Create user",
+                            "operationId": "createUser",
+                            "requestBody": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {"name": {"type": "string"}},
+                                            "required": ["name"]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "/users/{id}": {
+                        "get": {
+                            "summary": "Get user",
+                            "parameters": [
+                                {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = import_openapi(
+            dir.to_string_lossy().to_string(),
+            spec_path.to_string_lossy().to_string(),
+        )
+        .expect("import should succeed");
+        assert!(result.created.len() >= 3, "expected 3+ operations: got {}", result.created.len());
+
+        let mut found_get_users = false;
+        let mut found_post_users = false;
+        let mut found_get_user_by_id = false;
+        for created in &result.created {
+            let content = fs::read_to_string(created).unwrap();
+            // Path templating: OpenAPI {id} should become Dante {{id}}
+            if content.contains("GET https://api.example.com/v1/users/{{id}}") {
+                found_get_user_by_id = true;
+            } else if content.contains("GET https://api.example.com/v1/users\n")
+                || content.contains("GET https://api.example.com/v1/users\r\n")
+            {
+                found_get_users = true;
+            } else if content.contains("POST https://api.example.com/v1/users\n")
+                || content.contains("POST https://api.example.com/v1/users\r\n")
+            {
+                found_post_users = true;
+            }
+        }
+        assert!(found_get_users, "GET /users missing in: {:?}", result.created);
+        assert!(found_post_users, "POST /users missing");
+        assert!(found_get_user_by_id, "GET /users/{{id}} missing or path not transformed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_openapi_supports_yaml() {
+        let dir = temp_test_dir("openapi-yaml");
+        let spec_path = dir.join("openapi.yaml");
+        fs::write(
+            &spec_path,
+            r#"openapi: 3.0.0
+info:
+  title: YAML API
+  version: '1.0'
+servers:
+  - url: https://api.example.com
+paths:
+  /ping:
+    get:
+      summary: Ping
+"#,
+        )
+        .unwrap();
+
+        let result = import_openapi(
+            dir.to_string_lossy().to_string(),
+            spec_path.to_string_lossy().to_string(),
+        )
+        .expect("yaml import should succeed");
+        assert_eq!(result.created.len(), 1);
+        let content = fs::read_to_string(&result.created[0]).unwrap();
+        assert!(content.contains("GET https://api.example.com/ping"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- Postman var substitution helper ----
+
+    #[test]
+    fn postman_substitute_vars_passes_template_format() {
+        // Postman uses {{var}} same as Dante; the helper today is a no-op
+        assert_eq!(postman_substitute_vars("{{token}}"), "{{token}}");
+        assert_eq!(postman_substitute_vars("https://{{host}}/api"), "https://{{host}}/api");
+    }
+
+    // ---- OAuth end-to-end against a real local token endpoint ----
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// Run an HTTP server on a random port that responds with `response_body` (status 200)
+    /// and captures the request body bytes + content-type into the returned channel.
+    /// Returns (port, recv_for_captured_body, recv_for_captured_content_type, stop_flag).
+    fn spawn_token_endpoint(
+        response_body: String,
+        response_status: u16,
+    ) -> (
+        u16,
+        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Receiver<String>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use tiny_http::{Header, Response, Server};
+
+        let port = free_port();
+        let (body_tx, body_rx) = mpsc::channel::<String>();
+        let (ct_tx, ct_rx) = mpsc::channel::<String>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+
+        std::thread::spawn(move || {
+            let server = Server::http(format!("127.0.0.1:{port}")).unwrap();
+            loop {
+                if stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match server.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(Some(mut req)) => {
+                        let ct = req
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("content-type"))
+                            .map(|h| h.value.as_str().to_string())
+                            .unwrap_or_default();
+                        let mut body = String::new();
+                        let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+                        let _ = body_tx.send(body);
+                        let _ = ct_tx.send(ct);
+
+                        let mut resp = Response::from_string(&response_body)
+                            .with_status_code(response_status as i32);
+                        if let Ok(h) = Header::from_bytes(
+                            b"Content-Type" as &[u8],
+                            b"application/json" as &[u8],
+                        ) {
+                            resp = resp.with_header(h);
+                        }
+                        let _ = req.respond(resp);
+                    }
+                    Ok(None) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Give the server a moment to enter the recv loop
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        (port, body_rx, ct_rx, stop)
+    }
+
+    #[tokio::test]
+    async fn post_token_form_success_full_roundtrip() {
+        let canned = r#"{"access_token":"abc123","token_type":"Bearer","expires_in":3600}"#;
+        let (port, body_rx, ct_rx, stop) =
+            spawn_token_endpoint(canned.to_string(), 200);
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let form: Vec<(&str, String)> = vec![
+            ("grant_type", "client_credentials".to_string()),
+            ("client_id", "my-client-id".to_string()),
+            ("client_secret", "shhh secret!".to_string()),
+        ];
+        let result = post_token_form(
+            &client,
+            &format!("http://127.0.0.1:{port}/token"),
+            &form,
+            "test",
+        )
+        .await
+        .expect("token request should succeed");
+
+        // Verify response was parsed
+        assert_eq!(result["access_token"], "abc123");
+        assert_eq!(result["token_type"], "Bearer");
+        assert_eq!(result["expires_in"], 3600);
+
+        // Verify the request body our code sent
+        let received_body = body_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let received_ct = ct_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(
+            received_ct.contains("application/x-www-form-urlencoded"),
+            "wrong content-type: {received_ct}"
+        );
+        assert!(received_body.contains("grant_type=client_credentials"));
+        assert!(received_body.contains("client_id=my-client-id"));
+        // Special chars must be percent-encoded
+        assert!(
+            received_body.contains("client_secret=shhh+secret%21")
+                || received_body.contains("client_secret=shhh%20secret%21"),
+            "secret was not properly encoded: {received_body}"
+        );
+        assert!(!received_body.contains("shhh secret!"), "raw value leaked");
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn post_token_form_propagates_4xx_with_body() {
+        let canned = r#"{"error":"invalid_client","error_description":"Bad client_id"}"#;
+        let (port, _body_rx, _ct_rx, stop) =
+            spawn_token_endpoint(canned.to_string(), 401);
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let form: Vec<(&str, String)> = vec![
+            ("grant_type", "client_credentials".to_string()),
+            ("client_id", "bad".to_string()),
+        ];
+        let err = post_token_form(
+            &client,
+            &format!("http://127.0.0.1:{port}/token"),
+            &form,
+            "client_credentials",
+        )
+        .await
+        .expect_err("should fail on 401");
+
+        assert!(err.contains("client_credentials"), "missing label: {err}");
+        assert!(err.contains("401"), "missing status: {err}");
+        assert!(err.contains("invalid_client"), "missing body: {err}");
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn post_token_form_rejects_non_json_response() {
+        let (port, _, _, stop) = spawn_token_endpoint("not json".to_string(), 200);
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let form: Vec<(&str, String)> = vec![("grant_type", "x".to_string())];
+        let err = post_token_form(
+            &client,
+            &format!("http://127.0.0.1:{port}/token"),
+            &form,
+            "test",
+        )
+        .await
+        .expect_err("should fail to parse");
+        assert!(err.contains("parse"), "expected parse error: {err}");
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn post_token_form_handles_password_grant_with_special_chars() {
+        // Mirrors fetch_oauth_password's form. Password contains chars that BREAK auth
+        // if not properly url-encoded. This test catches that.
+        let canned = r#"{"access_token":"pwd-grant-token","token_type":"Bearer"}"#;
+        let (port, body_rx, _, stop) =
+            spawn_token_endpoint(canned.to_string(), 200);
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let form: Vec<(&str, String)> = vec![
+            ("grant_type", "password".to_string()),
+            ("client_id", "my-app".to_string()),
+            ("username", "alice@example.com".to_string()),
+            ("password", "p@ss w0rd!&".to_string()), // every char is dangerous
+        ];
+        let result = post_token_form(
+            &client,
+            &format!("http://127.0.0.1:{port}/token"),
+            &form,
+            "password",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["access_token"], "pwd-grant-token");
+
+        let received_body = body_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        // `@`, ` `, `!`, `&` must all be encoded; raw password must NOT appear
+        assert!(!received_body.contains("p@ss w0rd!&"), "raw password leaked: {received_body}");
+        assert!(received_body.contains("alice%40example.com"));
+        // Verify password param is round-trip safe by parsing the form back
+        let mut params: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for pair in received_body.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                let decoded = percent_encoding::percent_decode_str(&v.replace('+', " "))
+                    .decode_utf8_lossy()
+                    .to_string();
+                params.insert(k.to_string(), decoded);
+            }
+        }
+        assert_eq!(params.get("password").map(String::as_str), Some("p@ss w0rd!&"));
+        assert_eq!(params.get("username").map(String::as_str), Some("alice@example.com"));
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }

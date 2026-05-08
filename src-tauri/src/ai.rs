@@ -102,13 +102,13 @@ OUTPUT:
 
 Now do the same for the request below. Return only the JSON object."#;
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ExtractRule {
     pub var_name: String,
     pub source: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ReviewResult {
     pub suggested_name: String,
     pub summary: String,
@@ -147,6 +147,25 @@ enum AnthropicContentBlock {
 }
 
 pub async fn review_request(
+    api_key: String,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+) -> Result<ReviewResult, String> {
+    review_request_at(
+        ANTHROPIC_ENDPOINT,
+        api_key,
+        method,
+        url,
+        headers,
+        body,
+    )
+    .await
+}
+
+pub async fn review_request_at(
+    endpoint: &str,
     api_key: String,
     method: String,
     url: String,
@@ -215,7 +234,7 @@ pub async fn review_request(
         .map_err(|e| format!("serialize: {e}"))?;
 
     let resp = client
-        .post(ANTHROPIC_ENDPOINT)
+        .post(endpoint)
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .header("content-type", "application/json")
@@ -601,5 +620,222 @@ mod tests {
             _ => None,
         });
         assert_eq!(text.as_deref(), Some("actual response"));
+    }
+
+    // ---- End-to-end against a mocked Anthropic endpoint ----
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// Spawn a tiny_http server that responds with `response_body` and captures the request
+    /// body + x-api-key header for assertion.
+    fn spawn_anthropic_mock(
+        response_body: String,
+        response_status: u16,
+    ) -> (
+        u16,
+        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Receiver<String>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use tiny_http::{Header, Response, Server};
+
+        let port = free_port();
+        let (body_tx, body_rx) = mpsc::channel::<String>();
+        let (key_tx, key_rx) = mpsc::channel::<String>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+
+        std::thread::spawn(move || {
+            let server = Server::http(format!("127.0.0.1:{port}")).unwrap();
+            loop {
+                if stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match server.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(Some(mut req)) => {
+                        let api_key = req
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("x-api-key"))
+                            .map(|h| h.value.as_str().to_string())
+                            .unwrap_or_default();
+                        let mut body = String::new();
+                        let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+                        let _ = body_tx.send(body);
+                        let _ = key_tx.send(api_key);
+
+                        let mut resp = Response::from_string(&response_body)
+                            .with_status_code(response_status as i32);
+                        if let Ok(h) = Header::from_bytes(
+                            b"Content-Type" as &[u8],
+                            b"application/json" as &[u8],
+                        ) {
+                            resp = resp.with_header(h);
+                        }
+                        let _ = req.respond(resp);
+                    }
+                    Ok(None) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        (port, body_rx, key_rx, stop)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_request_full_roundtrip_against_mock_anthropic() {
+        // Canned Anthropic response — text block contains the JSON the model "produced"
+        let canned_review_json = r#"{
+            "suggested_name": "users-list",
+            "summary": "Lists users.",
+            "tests": ["status == 200", "header content-type contains \"json\""],
+            "extracts": [{"var_name": "firstId", "source": "body.data[0].id"}],
+            "security_observations": ["Bearer token hardcoded"]
+        }"#;
+        let anthropic_response = serde_json::json!({
+            "content": [{"type": "text", "text": canned_review_json}]
+        });
+        let (port, body_rx, key_rx, stop) =
+            spawn_anthropic_mock(anthropic_response.to_string(), 200);
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1/messages");
+        let result = review_request_at(
+            &endpoint,
+            "test-api-key-12345".to_string(),
+            "GET".to_string(),
+            "https://api.example.com/users".to_string(),
+            vec![("Authorization".to_string(), "Bearer real_secret_xxxxx".to_string())],
+            None,
+        )
+        .await
+        .expect("review should succeed");
+
+        // Verify the parsed result matches what the model "returned"
+        assert_eq!(result.suggested_name, "users-list");
+        assert_eq!(result.summary, "Lists users.");
+        assert_eq!(result.tests.len(), 2);
+        assert_eq!(result.extracts.len(), 1);
+        assert_eq!(result.extracts[0].var_name, "firstId");
+        assert_eq!(result.security_observations.len(), 1);
+
+        // Verify the request shape that hit Anthropic
+        let received_body = body_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let received_key = key_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+
+        // x-api-key header carries the user's key
+        assert_eq!(received_key, "test-api-key-12345");
+
+        // Body is JSON with the right model + system prompt + user prompt
+        let req_json: serde_json::Value = serde_json::from_str(&received_body)
+            .expect("Anthropic request body should be JSON");
+        assert_eq!(req_json["model"], "claude-sonnet-4-6");
+        assert!(req_json["max_tokens"].as_u64().unwrap() > 0);
+        assert!(req_json["messages"].is_array());
+        assert!(req_json["output_config"]["format"]["type"]
+            .as_str()
+            .unwrap()
+            .contains("json"));
+
+        // CRITICAL: the user message must NOT contain the raw secret — redaction must work in flight
+        let user_content = req_json["messages"][0]["content"]
+            .as_str()
+            .expect("user message content should be string");
+        assert!(
+            !user_content.contains("real_secret_xxxxx"),
+            "raw API secret leaked to Anthropic request body: {user_content}"
+        );
+        assert!(user_content.contains("<redacted>"));
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_request_propagates_4xx_with_truncated_body() {
+        let error_body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Bad model"}}"#;
+        let (port, _body_rx, _key_rx, stop) =
+            spawn_anthropic_mock(error_body.to_string(), 400);
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1/messages");
+        let err = review_request_at(
+            &endpoint,
+            "k".to_string(),
+            "GET".to_string(),
+            "https://api.example.com/x".to_string(),
+            vec![],
+            None,
+        )
+        .await
+        .expect_err("should fail on 400");
+
+        assert!(err.contains("anthropic"));
+        assert!(err.contains("400"));
+        assert!(err.contains("invalid_request_error"));
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_request_handles_unparseable_review_json() {
+        // Model returns text that's not valid JSON
+        let anthropic_response = serde_json::json!({
+            "content": [{"type": "text", "text": "I'm sorry, I can't help with that."}]
+        });
+        let (port, _, _, stop) =
+            spawn_anthropic_mock(anthropic_response.to_string(), 200);
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1/messages");
+        let err = review_request_at(
+            &endpoint,
+            "k".to_string(),
+            "GET".to_string(),
+            "https://api.example.com/x".to_string(),
+            vec![],
+            None,
+        )
+        .await
+        .expect_err("should fail when text isn't review JSON");
+
+        assert!(err.contains("could not parse review JSON"));
+        // Truncated text appears in error for debugging
+        assert!(err.contains("I'm sorry") || err.contains("can't help"));
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_request_errors_when_no_text_block() {
+        // Anthropic returns only a thinking block, no text block
+        let anthropic_response = serde_json::json!({
+            "content": [{"type": "thinking", "thinking": "just thinking..."}]
+        });
+        let (port, _, _, stop) =
+            spawn_anthropic_mock(anthropic_response.to_string(), 200);
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1/messages");
+        let err = review_request_at(
+            &endpoint,
+            "k".to_string(),
+            "GET".to_string(),
+            "https://api.example.com/x".to_string(),
+            vec![],
+            None,
+        )
+        .await
+        .expect_err("should fail when no text block");
+
+        assert!(err.contains("no text block"), "got: {err}");
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
